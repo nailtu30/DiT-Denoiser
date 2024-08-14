@@ -6,6 +6,32 @@ class GbufferDataset(Dataset):
     def __init__(self, noisy_img_path, ground_truth_path, transform=None, views=30) -> None:
         super().__init__()
         self.transform = transform
+        self.noisy_imgs, self.Galbedos, self.Gdepths, self.Gnormals, self.ground_truths = self.handle_dataset(noisy_img_path, ground_truth_path, views)
+    
+    def __len__(self):
+        return len(self.noisy_imgs)
+    
+    def __getitem__(self, index):
+        noisy_img = self.noisy_imgs[index]
+        Galbedo = self.Galbedos[index]
+        Gdepth = self.Gdepths[index]
+        Gnormal = self.Gnormals[index]
+        ground_truth = self.ground_truths[index]
+
+        noisy_img = Image.open(noisy_img).convert('RGB')
+        Galbedo = Image.open(Galbedo).convert('RGB')
+        Gdepth = Image.open(Gdepth).convert('RGB')
+        Gnormal = Image.open(Gnormal).convert('RGB')
+        ground_truth = Image.open(ground_truth).convert('RGB')
+
+        if self.transform:
+            noisy_img = self.transform(noisy_img)
+            Galbedo = self.transform(Galbedo)
+            Gdepth = self.transform(Gdepth)
+            Gnormal = self.transform(Gnormal)
+            ground_truth = self.transform(ground_truth)
+        
+        return noisy_img, Galbedo, Gdepth, Gnormal, ground_truth
     
 
     def handle_dataset(self, noisy_img_path, ground_truth_path, views):
