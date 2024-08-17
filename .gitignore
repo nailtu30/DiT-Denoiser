@@ -1,4 +1,7 @@
 mytest/
 training_results/
-
+__pycache__
 */**/__pycache__
+
+nohup.out
+plot_training_loss.py

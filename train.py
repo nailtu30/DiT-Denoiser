@@ -26,6 +26,8 @@ from diffusers.models import AutoencoderKL
 from dataset import GbufferDataset
 import csv
 
+from apex import amp
+
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -96,35 +98,44 @@ def main(args):
     model = DiT_models[args.model](
         input_size=latent_size,
     )
-    # Note that parameter initialization is done within the DiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
     model = model.to(device)
-    diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
+    if args.fp16:
+        model, opt = amp.initialize(models=model,
+                                          optimizers=opt,
+                                          opt_level=args.fp16_opt_level)
+        amp._amp_state.loss_scalers[0]._loss_scale = 2**20
+
+    # Note that parameter initialization is done within the DiT constructor
+    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    requires_grad(ema, False)
+    diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+
     # Setup data:
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        # transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+        transforms.Normalize((0.485,0.456,0.406), (0.229,0.224,0.225)),
     ])
     dataset = GbufferDataset(noisy_img_path=args.noisy_img_path, ground_truth_path=args.ground_truth_path, transform=transform)
     loader = DataLoader(
         dataset,
         batch_size=int(args.global_batch_size),
-        shuffle=False,
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    logger.info(f"Dataset contains {len(dataset):,} images ({args.noisy_img_path})")
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
@@ -132,6 +143,7 @@ def main(args):
     train_steps = 0
     log_steps = 0
     running_loss = 0
+    model.zero_grad()
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
@@ -151,10 +163,14 @@ def main(args):
             model_kwargs = dict(noisy_img=noisy_img, Galbedo=Galbedo, Gdepth=Gdepth, Gnormal=Gnormal)
             loss_dict = diffusion.training_losses(model, ground_truth, t, model_kwargs)
             loss = loss_dict["loss"].mean()
-            opt.zero_grad()
-            loss.backward()
+            if args.fp16:
+                with amp.scale_loss(loss, opt) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
             opt.step()
-            update_ema(ema, model.module)
+            opt.zero_grad()
+            update_ema(ema, model)
 
             # Log loss values:
             running_loss += loss.item()
@@ -178,7 +194,7 @@ def main(args):
                 start_time = time()
 
             # Save DiT checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
+            if train_steps % args.ckpt_every == 0 or train_steps == 1: # train_steps == 1 to test save checkpoint
                 checkpoint = {
                     "model": model.state_dict(),
                     "ema": ema.state_dict(),
@@ -207,17 +223,22 @@ def main(args):
 if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--noisy_img_path", type=str, required=True)
-    parser.add_argument("--ground_truth_path", type=str, required=True)
+    parser.add_argument("--noisy_img_path", type=str, default='/home/user1/codes/stanford-shapenet-renderer/rendering_results/spp1_mb5')
+    parser.add_argument("--ground_truth_path", type=str, default='/home/user1/codes/stanford-shapenet-renderer/rendering_results/spp4096_mb5')
     parser.add_argument("--results-dir", type=str, default="training_results")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
+    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-B/2") # DiT-XL/2
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=128)
+    parser.add_argument("--global-batch-size", type=int, default=64)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=5000)
+    parser.add_argument("--ckpt-every", type=int, default=50000)
+    parser.add_argument('--fp16', action='store_true',
+                        help="Whether to use 16-bit float precision instead of 32-bit")
+    parser.add_argument('--fp16_opt_level', type=str, default='O2',
+                        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
+                             "See details at https://nvidia.github.io/apex/amp.html")
     args = parser.parse_args()
     main(args)
